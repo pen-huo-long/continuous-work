@@ -1,9 +1,9 @@
 {
   "name": "@local/continuous-work",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "private": true,
   "type": "module",
-  "description": "Continuous work with manual retry during quota waits, recovery details and a separate settings page for custom budgets.",
+  "description": "Continuous work with a persistent recovery switch and per-turn quota wait limits.",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

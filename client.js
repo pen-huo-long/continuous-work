@@ -4,62 +4,62 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const { createPortal } = require('react-dom');
     const h = React.createElement;
-    const ACTIVE_PHASES = ['armed', 'running', 'waiting', 'retrying'];
+    const CAPABILITY_MARKER = 'per-turn-rounds-v2';
     const en = {
-      title: 'Continuous work', triggerTitle: 'Continuous work', enable: 'Enable recovery', stop: 'Stop', save: 'Save limits',
+      title: 'Continuous work', triggerTitle: 'Continuous work', enable: 'Enable recovery', stop: 'Stop', save: 'Save limit',
       retryNow: 'Retry now', retryRequested: 'Retrying the original step', processing: 'Processing…',
       manualRetryHint: 'After restoring quota manually, retry the original step immediately.',
-      restartRequired: 'The backend plugin is still an older version. Restart Harness to load this feature; refreshing the page is not enough.',
+      restartRequired: 'Update and reload the plugin to use per-turn wait rounds without interrupting execution.',
       checkingBackend: 'Checking backend…', capabilityError: 'Could not check backend capabilities. Reopen this panel to retry.',
       off: 'Off', armed: 'Ready', running: 'Working', waiting: 'Waiting for quota',
-      retrying: 'Retrying', stopped: 'Stopped', expired: 'Time limit reached',
-      exhausted: 'Recovery budget reached', interrupted: 'Interrupted',
+      retrying: 'Retrying', stopped: 'Off', exhausted: 'Turn wait limit reached', interrupted: 'Interrupted',
       loading: 'Loading…', unavailable: 'Recovery command unavailable', close: 'Close details',
-      state: 'Status', progress: 'Quota windows', window: '{current} / {max}',
-      recovered: '{count} successful recoveries', probes: 'Retries this recovery',
-      started: 'Started', deadline: 'Deadline', until: 'Next attempt', remaining: 'Time remaining',
-      duration: '{hours}h {minutes}m {seconds}s', none: '—', settings: 'Recovery limits',
-      windows: 'Total quota windows', hours: 'Total time limit (hours)',
-      bounds: 'Custom values · no fixed upper limit', info: 'Back', settingsTitle: 'Settings', saveEnable: 'Save and enable',
-      monitoring: 'Monitoring quota. Recovery details appear when a quota limit is reached.',
-      inactive: 'Quota recovery is off. Enable it to wait and retry after a quota limit.',
-      waitRemaining: 'Next attempt in', noLimit: 'Enter a positive value; no fixed upper limit.',
-      windowHelp: 'A window counts a successful quota recovery, not a conversation turn. The current window counts toward the limit.',
-      timeHelp: 'The total time includes waits and is measured from the original start. Saving keeps the current progress and retry count.',
-      idleHelp: 'Enable for this session. Quota failures wait and retry the original step. Keep Harness and the computer running.',
-      saved: 'Limits saved', enabled: 'Quota recovery enabled', stoppedNotice: 'Recovery stopped', saving: 'Saving…',
-      invalidWindows: 'Enter a positive integer of at least {min}.', invalidHours: 'Enter a positive, finite number of hours.', invalidDeadline: 'The resulting deadline cannot be represented as a valid date.',
-      pastDeadline: 'The new deadline must be in the future.', unchanged: 'Current limits',
-      elapsed: 'Elapsed time', stopHelp: 'Stopping also cancels the current execution.',
-      resumeHelp: 'Enable again to start a new recovery budget.',
+      state: 'Status', progress: 'Wait rounds this turn', window: '{current} / {max}',
+      roundNote: 'The next turn starts counting from zero again.', probes: 'Retries this turn',
+      until: 'Next attempt', duration: '{hours}h {minutes}m {seconds}s', none: '—', settings: 'Recovery limit',
+      windows: 'Maximum wait rounds per turn', bounds: 'Custom value · no fixed upper limit',
+      info: 'Back', settingsTitle: 'Settings', saveEnable: 'Save and enable',
+      monitoring: 'Recovery stays enabled for this session. Wait rounds reset with each new turn.',
+      inactive: 'Recovery is off. The conversation can keep running normally.',
+      legacyNotice: 'The previous session state is read-only until the updated plugin is loaded.',
+      exhaustedHelp: 'This turn has used its wait rounds. Recovery stays enabled and resets for the next turn.',
+      waitingDisabled: 'Waiting · recovery off',
+      retainedWait: 'Recovery is off. The current wait will finish and retry as scheduled; no further waits will be added.',
+      stopHelp: 'Turning recovery off does not cancel execution. The current wait and its next attempt are kept; no further waits will be added.',
+      waitRemaining: 'Next attempt in',
+      windowHelp: 'Each quota wait uses one round. The count starts at zero for each new turn. Saving changes the limit without resetting the current count.',
+      idleHelp: 'The switch persists for this session. Turning recovery on or off does not stop the conversation. Keep Harness and the computer running.',
+      saved: 'Limit saved', enabled: 'Quota recovery enabled', stoppedNotice: 'Recovery disabled; the current execution is not cancelled.',
+      stoppedWaitingNotice: 'Recovery disabled. The current wait will finish and retry as scheduled; no further waits will be added.', saving: 'Saving…',
+      invalidWindows: 'Enter a positive integer of at least {min}.',
     };
     const zh = {
       title: '连续工作', triggerTitle: 'Continuous work', enable: '启用托管', stop: '停止', save: '保存上限',
       retryNow: '立即重试', retryRequested: '正在重试原步骤', processing: '处理中…',
       manualRetryHint: '手动恢复额度后，可立即重试原步骤。',
-      restartRequired: '后台插件仍为旧版本，请重启 Harness 以加载此功能；仅刷新页面不会更新后台。',
+      restartRequired: '请更新并重新加载插件，以使用按对话计数且不中断执行的托管开关。',
       checkingBackend: '正在核对后台…', capabilityError: '无法读取后台功能，请重新打开面板重试。',
       off: '未启用', armed: '已就绪', running: '工作中', waiting: '等待额度恢复',
-      retrying: '重试中', stopped: '已停止', expired: '已到运行时限',
-      exhausted: '已到恢复上限', interrupted: '已中断',
+      retrying: '重试中', stopped: '未启用', exhausted: '本次对话等待轮次已用完', interrupted: '已中断',
       loading: '读取中…', unavailable: '托管命令不可用', close: '关闭详情',
-      state: '运行状态', progress: '额度窗口', window: '{current} / {max}',
-      recovered: '已成功恢复 {count} 次', probes: '本次恢复重试',
-      started: '开始时间', deadline: '运行截止', until: '下次尝试', remaining: '剩余时长',
-      duration: '{hours}时 {minutes}分 {seconds}秒', none: '—', settings: '托管上限',
-      windows: '额度窗口总数', hours: '总运行时限（小时）',
-      bounds: '自定义数值 · 无固定上限', info: '返回', settingsTitle: '设置', saveEnable: '保存并启用',
-      monitoring: '正在监测额度，触发限额时显示恢复详情。',
-      inactive: '启用后将在额度受限时等待恢复，并重试原步骤。',
-      waitRemaining: '距下次尝试', noLimit: '输入正数，无固定上限。',
-      windowHelp: '窗口按额度受限后成功恢复计数，与对话轮次无关；上限包含当前窗口。',
-      timeHelp: '时限包含等待，从本次托管开始计算。保存后保留当前进度与重试计数。',
-      idleHelp: '仅对当前会话启用。额度受限后等待恢复并重试原步骤，请保持 Harness 和机器运行。',
-      saved: '上限已保存', enabled: '已启用额度托管', stoppedNotice: '已停止执行', saving: '保存中…',
-      invalidWindows: '请输入不小于 {min} 的正整数。', invalidHours: '请输入大于 0 的有限小时数。', invalidDeadline: '该时限超出了可表示的日期范围。',
-      pastDeadline: '调整后的截止时间须晚于当前时间。', unchanged: '当前上限',
-      elapsed: '已用时长', stopHelp: '停止托管会同时取消当前执行。',
-      resumeHelp: '重新启用将开始一次新的托管。',
+      state: '运行状态', progress: '本次对话等待轮次', window: '{current} / {max}',
+      roundNote: '下次对话将从 0 重新计数。', probes: '本次对话重试',
+      until: '下次尝试', duration: '{hours}时 {minutes}分 {seconds}秒', none: '—', settings: '托管上限',
+      windows: '每次对话最多等待轮次', bounds: '自定义数值 · 无固定上限',
+      info: '返回', settingsTitle: '设置', saveEnable: '保存并启用',
+      monitoring: '托管保持开启，每次新对话重新计算等待轮次。',
+      inactive: '托管已关闭，对话可正常执行。',
+      legacyNotice: '旧版会话状态仅供查看，请加载新版插件。',
+      exhaustedHelp: '本次对话已用完等待轮次；托管仍开启，下次对话自动重新计数。',
+      waitingDisabled: '等待中 · 托管已关闭',
+      retainedWait: '托管已关闭；当前等待完成后照常尝试，后续不再自动等待。',
+      stopHelp: '停止托管不会取消当前执行；当前等待完成后照常尝试，后续不再自动等待。',
+      waitRemaining: '距下次尝试',
+      windowHelp: '每次因额度受限进入等待计 1 轮，新对话从 0 开始。保存后只更新上限，保留本次已用轮次。',
+      idleHelp: '开关在当前会话中持久保存；启停托管不终止对话。请保持 Harness 和机器运行。',
+      saved: '上限已保存', enabled: '已启用额度托管', stoppedNotice: '已关闭托管，不会取消当前执行。',
+      stoppedWaitingNotice: '已关闭托管；当前等待完成后照常尝试，后续不再自动等待。', saving: '保存中…',
+      invalidWindows: '请输入不小于 {min} 的正整数。',
     };
     const css = `
       .cw-root { display:inline-flex; flex:none; align-items:center; }
@@ -102,7 +102,6 @@ window.__ModuleLoader__.load({
       .cw-page-link { display:inline-flex; align-items:center; gap:4px; padding:2px 6px; border:0; border-radius:var(--dsw-radius-sm); background:transparent; color:var(--dsw-alias-label-secondary); }
       .cw-page-link:hover { background:var(--dsw-alias-interactive-bg-hover); }
       .cw-info-note { margin:12px 0; }
-      .cw-settings-summary { border-top:1px solid var(--dsw-alias-border-l1); margin-top:12px; padding-top:6px; }
       .cw-settings-heading { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-bottom:10px; }
       .cw-settings-heading strong { font-weight:500; color:var(--dsw-alias-label-primary); }
       .cw-settings-heading small { font-size:11px; }
@@ -124,14 +123,14 @@ window.__ModuleLoader__.load({
       if (phase === 'armed') return 'ready';
       if (['running', 'retrying'].includes(phase)) return 'running';
       if (phase === 'waiting') return 'waiting';
-      if (['expired', 'exhausted', 'interrupted'].includes(phase)) return 'ended';
+      if (['exhausted', 'interrupted'].includes(phase)) return 'ended';
       return 'idle';
     }
     function StatusIcon({ phase }) {
       const spinning = ['running', 'retrying', 'loading'].includes(phase);
       const center = phase === 'waiting' ? h('path', { d: 'M7 6.5h4M7 11.5h4M7 6.5c0 2 4 3 4 5M11 6.5c0 2-4 3-4 5' }) :
         phase === 'armed' || spinning ? h('path', { d: 'm8 6.5 3.5 2.5L8 11.5Z', fill: 'currentColor', stroke: 'none' }) :
-        ['expired', 'exhausted', 'interrupted'].includes(phase) ? h('path', { d: 'M9 5.8v4M9 12v.2' }) :
+        ['exhausted', 'interrupted'].includes(phase) ? h('path', { d: 'M9 5.8v4M9 12v.2' }) :
         h('path', { d: 'M6.5 9h5' });
       return h('svg', { width: 18, height: 18, viewBox: '0 0 18 18', fill: 'none', stroke: 'currentColor',
         strokeWidth: 1.35, strokeLinecap: 'round', strokeLinejoin: 'round', className: `cw-icon cw-tone-${tone(phase)}`, 'aria-hidden': true },
@@ -154,7 +153,6 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState('');
       const [backend, setBackend] = React.useState(null);
       const [windows, setWindows] = React.useState('3');
-      const [hours, setHours] = React.useState('18');
       const [position, setPosition] = React.useState(null);
       const rootRef = React.useRef(null);
       const triggerRef = React.useRef(null);
@@ -164,12 +162,14 @@ window.__ModuleLoader__.load({
       const pending = React.useRef(false);
       const mounted = React.useRef(true);
       const dialogId = `cw-${React.useId().replaceAll(':', '')}`;
-      const active = run && clock < run.deadlineAt && ACTIVE_PHASES.includes(run.phase);
-      const phase = projection === undefined ? 'loading' : !run ? 'off' :
-        ACTIVE_PHASES.includes(run.phase) && clock >= run.deadlineAt ? 'expired' :
-          active && !['waiting', 'retrying'].includes(run.phase) ? (sessionRunning ? 'running' : 'armed') : run.phase;
-      const recovering = !!(active && sessionRunning && run.pendingRecovery && ['waiting', 'retrying'].includes(run.phase));
+      const currentSchema = !run || typeof run.enabled === 'boolean';
+      const active = run?.enabled === true;
+      const recovering = !!(currentSchema && run && sessionRunning && ['waiting', 'retrying'].includes(run.phase));
       const waiting = recovering && run.phase === 'waiting' && run.nextRetryAt != null;
+      const phase = projection === undefined ? 'loading' : !run ? 'off' : !currentSchema ?
+        (run.phase === 'expired' ? 'interrupted' : run.phase) : recovering ? run.phase : !active ? 'stopped' :
+          ['armed', 'running'].includes(run.phase) ? (sessionRunning ? 'running' : 'armed') : run.phase;
+      const controlsReady = !!(backend?.roundsV2 && currentSchema);
       React.useEffect(() => {
         mounted.current = true;
         return () => { mounted.current = false; };
@@ -181,20 +181,19 @@ window.__ModuleLoader__.load({
         getCapabilities().then((capabilities) => {
           if (!disposed) setBackend(capabilities);
         }, () => {
-          if (!disposed) setBackend({ retry: false, update: false, error: true });
+          if (!disposed) setBackend({ roundsV2: false, retry: false, update: false, error: true });
         });
         return () => { disposed = true; };
       }, [open, getCapabilities]);
       React.useEffect(() => {
         setWindows(String(run?.maxWindows ?? 3));
-        setHours(String(run ? (run.deadlineAt - run.startedAt) / 3_600_000 : 18));
-      }, [run?.id, run?.maxWindows, run?.startedAt, run?.deadlineAt]);
+      }, [run?.id, run?.maxWindows]);
       React.useEffect(() => {
         setClock(Date.now());
-        if (!run || !ACTIVE_PHASES.includes(run.phase)) return;
-        const timer = setInterval(() => setClock(Date.now()), open && page === 'info' && waiting ? 1000 : 30_000);
+        if (!open || page !== 'info' || !waiting) return;
+        const timer = setInterval(() => setClock(Date.now()), 1000);
         return () => clearInterval(timer);
-      }, [run?.id, run?.phase, run?.deadlineAt, open, page, waiting]);
+      }, [open, page, waiting, run?.nextRetryAt]);
       function dismiss(restoreFocus) {
         setOpen(false);
         if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
@@ -268,17 +267,14 @@ window.__ModuleLoader__.load({
           if (mounted.current) setBusy(false);
         }
       }
-      const minWindows = active ? run.window + (run.pendingRecovery ? 1 : 0) : 1;
+      const minWindows = 1;
       const windowsValue = Number(windows);
-      const hoursValue = Number(hours);
-      const candidateStart = active ? run.startedAt : clock;
-      const candidateDeadline = Math.ceil(candidateStart + hoursValue * 3_600_000);
-      const startParameters = run ? `${run.maxWindows} ${(run.deadlineAt - run.startedAt) / 3_600_000}` : '3 18';
+      const startParameters = String(run?.maxWindows ?? 3);
       const validation = !Number.isSafeInteger(windowsValue) || windowsValue < minWindows ?
-        t('invalidWindows', { min: minWindows }) : !Number.isFinite(hoursValue) || hoursValue <= 0 ? t('invalidHours') :
-          !Number.isSafeInteger(candidateDeadline) || candidateDeadline <= candidateStart || !Number.isFinite(new Date(candidateDeadline).getTime()) ? t('invalidDeadline') :
-            active && candidateDeadline <= clock ? t('pastDeadline') : '';
-      const changed = !active || windowsValue !== run.maxWindows || candidateDeadline !== run.deadlineAt;
+        t('invalidWindows', { min: minWindows }) : '';
+      const changed = !active || windowsValue !== run.maxWindows;
+      const settingsSupported = controlsReady && !!backend?.[active ? 'update' : 'start'];
+      const normalNotice = !currentSchema ? 'legacyNotice' : active && run.phase === 'exhausted' ? 'exhaustedHelp' : active ? 'monitoring' : 'inactive';
       const time = (value) => value == null ? t('none') : new Date(value).toLocaleString();
       const duration = (value) => {
         const seconds = Math.max(0, Math.ceil(value / 1000));
@@ -292,7 +288,8 @@ window.__ModuleLoader__.load({
         setError('');
         setNotice('');
       }
-      const statusLabel = `${t('triggerTitle')} · ${t(phase)}`;
+      const stateLabel = waiting && !active ? t('waitingDisabled') : t(phase);
+      const statusLabel = `${t('triggerTitle')} · ${stateLabel}`;
       function switchPage(nextPage) {
         setPage(nextPage);
         setError('');
@@ -319,49 +316,48 @@ window.__ModuleLoader__.load({
       h('div', { className: 'cw-title-rule', 'aria-hidden': true }),
       !settingsPage && h(React.Fragment, null,
         h('div', { className: 'cw-status' }, h('span', null, t('state')),
-          h('span', { className: `cw-status-value cw-tone-${tone(phase)}`, role: 'status' }, t(phase))),
+          h('span', { className: `cw-status-value cw-tone-${tone(phase)}`, role: 'status' }, stateLabel)),
         recovering ? h(React.Fragment, null,
           h('div', { className: 'cw-progress' },
             h('div', { className: 'cw-progress-heading' }, h('span', null, t('progress')),
               h('strong', null, t('window', { current: run.window, max: run.maxWindows }))),
             h('div', { className: 'cw-track', 'aria-hidden': true },
               h('span', { className: 'cw-track-fill', style: { width: `${Math.min(100, run.window / run.maxWindows * 100)}%` } })),
-            h('p', { className: 'cw-note' }, t('recovered', { count: Math.max(0, run.window - 1) }))),
-          h('dl', { className: 'cw-metrics' }, metric('probes', `${run.attempts} / 48`),
+            h('p', { className: 'cw-note' }, t(!active && waiting ? 'retainedWait' : 'roundNote'))),
+          h('dl', { className: 'cw-metrics' }, metric('probes', String(run.attempts)),
             waiting && metric('waitRemaining', duration(run.nextRetryAt - clock)),
             waiting && metric('until', time(run.nextRetryAt)))) :
-          h('p', { className: 'cw-note cw-info-note' }, t(active ? 'monitoring' : 'inactive')),
+          h('p', { className: 'cw-note cw-info-note' }, t(normalNotice)),
         h('div', { className: 'cw-actions' },
-          active ? h('button', { type: 'button', className: 'cw-action cw-action-stop', disabled: busy,
-            onClick: () => act('stop', 'stoppedNotice') }, t('stop')) :
-            h('button', { type: 'button', className: 'cw-action cw-action-primary', disabled: busy || projection === undefined,
-              onClick: () => act(`start ${startParameters}`, 'enabled') }, t('enable')),
-          waiting && h('button', { type: 'button', className: 'cw-action cw-action-primary', disabled: busy || !backend?.retry,
+          active ? h('button', { type: 'button', className: 'cw-action cw-action-stop',
+            disabled: busy || projection === undefined || !controlsReady || !backend?.stop,
+            onClick: () => act('stop', waiting ? 'stoppedWaitingNotice' : 'stoppedNotice') }, t('stop')) :
+            h('button', { type: 'button', className: 'cw-action cw-action-primary',
+              disabled: busy || projection === undefined || !controlsReady || !backend?.start,
+              onClick: () => act(`start ${startParameters}`, 'enabled') }, t(backend === null ? 'checkingBackend' : 'enable')),
+          waiting && h('button', { type: 'button', className: 'cw-action cw-action-primary',
+            disabled: busy || !active || !controlsReady || !backend?.retry,
             onClick: () => act('retry', 'retryRequested') }, t(backend === null ? 'checkingBackend' : busy ? 'processing' : 'retryNow'))),
-        waiting && backend?.retry && h('p', { className: 'cw-note' }, t('manualRetryHint'))),
+        waiting && active && h('p', { className: 'cw-note' }, t('stopHelp')),
+        waiting && active && backend?.retry && h('p', { className: 'cw-note' }, t('manualRetryHint'))),
       settingsPage && h('form', { className: 'cw-form', 'aria-busy': busy, onSubmit: (event) => {
         event.preventDefault();
-        if (validation || !changed || projection === undefined || !backend?.update) return;
-        act(`${active ? 'update' : 'start'} ${windowsValue} ${hoursValue}`, active ? 'saved' : 'enabled');
+        if (validation || !changed || projection === undefined || !settingsSupported) return;
+        act(`${active ? 'update' : 'start'} ${windowsValue}`, active ? 'saved' : 'enabled');
       } },
         h('div', { className: 'cw-settings-heading' }, h('strong', null, t('settings')), h('small', null, t('bounds'))),
         h('div', { className: 'cw-fields' },
           h('label', { className: 'cw-field' }, t('windows'), h('input', { type: 'number', value: windows, min: minWindows, step: 1,
-            disabled: busy || projection === undefined || !backend?.update, 'aria-describedby': `${dialogId}-window-help`,
-            onChange: (event) => change(setWindows, event.target.value) })),
-          h('label', { className: 'cw-field' }, t('hours'), h('input', { type: 'number', value: hours, min: 0, step: 'any',
-            disabled: busy || projection === undefined || !backend?.update, 'aria-describedby': `${dialogId}-time-help`,
-            onChange: (event) => change(setHours, event.target.value) }))),
+            disabled: busy || projection === undefined || !settingsSupported, 'aria-describedby': `${dialogId}-window-help`,
+            onChange: (event) => change(setWindows, event.target.value) }))),
         h('p', { className: 'cw-note', id: `${dialogId}-window-help` }, t('windowHelp')),
-        h('p', { className: 'cw-note', id: `${dialogId}-time-help` }, t(active ? 'timeHelp' : 'idleHelp')),
-        active && h('dl', { className: 'cw-metrics cw-settings-summary' },
-          metric('started', time(run.startedAt)), metric('deadline', time(run.deadlineAt))),
+        h('p', { className: 'cw-note' }, t('idleHelp')),
         h('div', { className: 'cw-actions' },
-          h('button', { type: 'submit', className: 'cw-action cw-action-primary', disabled: busy || projection === undefined || !backend?.update || !!validation || !changed },
+          h('button', { type: 'submit', className: 'cw-action cw-action-primary', disabled: busy || projection === undefined || !settingsSupported || !!validation || !changed },
             t(busy ? 'saving' : active ? 'save' : 'saveEnable'))),
         validation && h('p', { className: 'cw-feedback cw-error', role: 'status' }, validation)),
       backend?.error && h('p', { className: 'cw-feedback cw-error', role: 'alert' }, t('capabilityError')),
-      !backend?.error && (waiting && backend?.retry === false || settingsPage && backend?.update === false) &&
+      backend && !backend.error && (!backend.roundsV2 || !currentSchema) &&
         h('p', { className: 'cw-feedback cw-error', role: 'status' }, t('restartRequired')),
       error && h('p', { className: 'cw-feedback cw-error', role: 'alert' }, error),
       notice && h('p', { className: 'cw-feedback cw-success', role: 'status' }, notice));
@@ -380,8 +376,11 @@ window.__ModuleLoader__.load({
           const result = await commands.list(sessionId);
           if (!result.ok) throw new Error(result.error.message);
           const command = result.value.find((entry) => entry.name === 'codex-work');
-          const actions = new Set((command?.input?.hint ?? '').split('|').map((part) => part.trim().split(/\s+/u)[0]));
-          return { retry: actions.has('retry'), update: actions.has('update') };
+          const hint = command?.input?.hint ?? '';
+          const roundsV2 = hint.split(/[\s|]+/u).includes(CAPABILITY_MARKER);
+          const actions = new Set(hint.split('|').map((part) => part.trim().split(/\s+/u)[0]));
+          return { roundsV2, start: roundsV2 && actions.has('start'), stop: roundsV2 && actions.has('stop'),
+            retry: roundsV2 && actions.has('retry'), update: roundsV2 && actions.has('update') };
         }
         ctx.effect(() => ctx.locale.register('codexContinuity', 'en', en));
         ctx.effect(() => ctx.locale.register('codexContinuity', 'zh', zh));
@@ -392,9 +391,9 @@ window.__ModuleLoader__.load({
             getCapabilities: () => getCapabilities(sessionId),
             onAction: async (action) => {
               const operation = action.split(/\s+/u)[0];
-              if (operation === 'retry' || operation === 'update') {
-                const capabilities = await getCapabilities(sessionId);
-                if (!capabilities[operation]) throw new Error(ctx.locale.bind('codexContinuity')('restartRequired'));
+              const capabilities = await getCapabilities(sessionId);
+              if (!capabilities.roundsV2 || !capabilities[operation]) {
+                throw new Error(ctx.locale.bind('codexContinuity')('restartRequired'));
               }
               const result = await commands.execute(sessionId, `/codex-work ${action}`, []);
               if (!result.ok) throw new Error(result.error.message);

@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
 import { apply } from '../index.js';
-import { POLICY_KEY, PROVIDER, HOUR, MAX_PROBES, parseInput, classifyQuota, retryDelay,
-  reduceState, initialState, waitUntil, deadlineFor, MAX_DATE_MS } from '../core.js';
+import { POLICY_KEY, PROVIDER, HOUR, parseInput, classifyQuota, retryDelay,
+  reduceState, initialState, waitUntil } from '../core.js';
 
 const quotaFailure = (minutes = 5) => ({ code: 'PI_AI_ERROR',
   message: `You have hit your ChatGPT usage limit (plus plan). Try again in ~${minutes} min.` });
@@ -52,11 +52,11 @@ function fixture(options = {}) {
     const abort = new AbortController();
     const events = [];
     const agent = { id, abort, events, cancellations: [],
-      model: { current: () => ({ provider }) },
+      turn: 1, step: 2, model: { current: () => ({ provider }) },
       cancel(cause) {
         agent.cancellations.push(cause);
-        abort.abort(cause);
-        agent.session.append('turn/end', { turn: 1, reason: { kind: 'aborted', reason: cause } });
+        agent.abort.abort(cause);
+        agent.session.append('turn/end', { turn: agent.turn, reason: { kind: 'aborted', reason: cause } });
       },
       session: { id, eventAt: (seq) => events[seq], append(type, data) {
         const event = { type, data, time: clock, seq: events.length };
@@ -71,6 +71,7 @@ function fixture(options = {}) {
       } },
     };
     agents.push(agent);
+    agent.session.append('turn/start', { turn: 1 });
     return agent;
   }
   const defaultWait = async (deadline, signal) => { if (signal.aborted) return false; clock = deadline; return true; };
@@ -81,43 +82,51 @@ function fixture(options = {}) {
     setClock: (value) => { clock = value; },
     getClock: () => clock,
     operate: (agent, input) => ctx.commands.execute(agent, `/codex-work ${input}`, [], new AbortController().signal),
-    tool: () => tool, command: () => command,
+    tool: () => tool, command: () => command, definition: () => definition,
+    startTurn(agent, turn) { agent.turn = turn; agent.abort = new AbortController(); agent.session.append('turn/start', { turn }); },
     recover: (agent, failure = quotaFailure(), next = async () => undefined,
-      provider = agent.model.current().provider) => listeners.get('agent/request-error')({
-      agent, turn: 1, step: 2, provider, failure, signal: agent.abort.signal,
-    }, next),
+      provider = agent.model.current().provider) => {
+      agent.session.append('assistant/attempt', { turn: agent.turn, step: agent.step,
+        stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error', failure } } }] });
+      return listeners.get('agent/request-error')({ agent, turn: agent.turn, step: agent.step, provider, failure, signal: agent.abort.signal }, next);
+    },
     async dispose() { for (const effect of effects.reverse()) await effect?.(); },
   };
 }
 
 function success(agent) {
-  agent.session.append('assistant/message', { turn: 1, step: 2, message: { source: { provider: agent.model.current().provider } } });
+  agent.session.append('assistant/message', { turn: agent.turn, step: agent.step, message: { source: { provider: agent.model.current().provider } } });
 }
 
-test('Magpie Responses can arm and recover through three windows with correct counting', async (t) => {
+test('Magpie Responses spends exactly N wait rounds per turn and delegates the next failure', async (t) => {
   const f = fixture({ provider: 'magpie-responses' }); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  assert.equal((await f.operate(agent, 'start 3 18')).result.kind, 'success');
-  assert.notEqual(classifyQuota('magpie-responses', quotaFailure()), null);
-  assert.equal(classifyQuota('magpie-responses', { code: 'RATE_LIMIT', message: '429 Too many requests' }), null);
-  for (let window = 2; window <= 3; window++) {
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
+  assert.equal(f.run(agent).window, 0);
+  for (let round = 1; round <= 3; round++) {
     assert.deepEqual(await f.recover(agent), { kind: 'retry' });
+    assert.equal(f.run(agent).window, round);
     success(agent);
-    assert.equal(f.run(agent).window, window);
-    assert.equal(f.run(agent).attempts, 0);
+    assert.equal(f.run(agent).window, round);
+    assert.equal(f.run(agent).attempts, round);
   }
-  assert.equal(await f.recover(agent), undefined);
+  let delegated = 0;
+  assert.deepEqual(await f.recover(agent, quotaFailure(), async () => { delegated++; return { kind: 'retry' }; }), { kind: 'retry' });
+  assert.equal(delegated, 1);
   assert.equal(f.run(agent).phase, 'exhausted');
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(agent.cancellations.length, 0);
 });
 
-test('Magpie Responses runs the same pre-step deadline guard', async (t) => {
-  const f = fixture({ provider: 'magpie-responses' }); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 1');
-  f.setClock(f.getClock() + HOUR);
-  const decision = await f.listeners.get('agent/pre-step')({ agent,
-    modelSelection: agent.model.current(), signal: agent.abort.signal }, async () => ({ kind: 'enter', messages: [] }));
-  assert.deepEqual(decision, { kind: 'reject' });
-  assert.equal(f.run(agent).phase, 'expired');
+test('persistent enable has no pre-step rejection or watchdog deadline', async (t) => {
+  const timers = { setTimeout() { throw new Error('Unexpected watchdog'); }, clearTimeout() {} };
+  const f = fixture({ timers }); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start');
+  f.setClock(f.getClock() + 10_000 * HOUR);
+  assert.equal(f.listeners.has('agent/pre-step'), false);
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal('deadlineAt' in f.run(agent), false);
+  assert.equal(agent.abort.signal.aborted, false);
+  assert.deepEqual(await f.recover(agent), { kind: 'retry' });
 });
 
 test('quota evidence: QUOTA code or windowed-limit wording on any provider', () => {
@@ -142,7 +151,7 @@ test('ZCode windowed limit yields the exact absolute reset wait', () => {
 test('ZCode recovery runs through the same managed wait', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
   const agent = f.newAgent();
-  await f.operate(agent, 'start 3 18');
+  await f.operate(agent, 'start 3');
   const before = f.getClock();
   assert.deepEqual(await f.recover(agent, zcodeFailure(new Date(before + 2 * HOUR).toLocaleString('sv-SE'))), { kind: 'retry' });
   const record = agent.events.find((e) => e.type === 'llm/retry');
@@ -151,14 +160,12 @@ test('ZCode recovery runs through the same managed wait', async (t) => {
   assert.ok(agent.events.some((e) => e.type === 'llm/retry-started'));
 });
 
-test('validates finite windows and wall-clock limits', () => {
-  assert.deepEqual(parseInput('start'), { action: 'start', windows: 3, hours: 18 });
-  assert.deepEqual(parseInput('start 100 72'), { action: 'start', windows: 100, hours: 72 });
-  assert.deepEqual(parseInput('start 9 0.25'), { action: 'start', windows: 9, hours: 0.25 });
+test('new commands accept only a positive safe-integer per-turn wait budget', () => {
+  assert.deepEqual(parseInput('start'), { action: 'start', windows: 3 });
+  assert.deepEqual(parseInput('start 100'), { action: 'start', windows: 100 });
+  assert.deepEqual(parseInput('update 1'), { action: 'update', windows: 1 });
   for (const input of ['start 0', 'start -1', 'start 2.5', 'start 9007199254740992',
-    'start 2 NaN', 'start 2 Infinity', 'start 2 0', 'start 2 -0.5', 'stop yes']) {
-    assert.throws(() => parseInput(input));
-  }
+    'start 2 18', 'update 2 24', 'update', 'stop yes']) assert.throws(() => parseInput(input));
 });
 
 test('replays command success only, preserving unrelated event identity', () => {
@@ -170,33 +177,34 @@ test('replays command success only, preserving unrelated event identity', () => 
   assert.deepEqual(state.pending, {});
 });
 
-test('two quota recoveries reach three windows in the same step, without messages or tool replay', async (t) => {
+test('wait rounds preserve the original step without new messages or completed tool replay', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  await f.operate(agent, 'start 3 18');
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
   agent.session.append('user/message', { content: 'original task' });
   agent.session.append('tool/result', { value: 'already completed' });
-  for (let window = 2; window <= 3; window++) {
+  for (let round = 1; round <= 3; round++) {
     assert.deepEqual(await f.recover(agent), { kind: 'retry' });
-    assert.equal(f.run(agent).window, window - 1);
-    success(agent);
-    assert.equal(f.run(agent).window, window);
+    success(agent); assert.equal(f.run(agent).window, round);
   }
   assert.equal(agent.events.filter((e) => e.type === 'user/message').length, 1);
   assert.equal(agent.events.filter((e) => e.type === 'tool/result').length, 1);
   assert.ok(agent.events.filter((e) => e.type === 'llm/retry').every((e) => e.data.turn === 1 && e.data.step === 2));
   assert.equal(await f.recover(agent), undefined);
-  assert.equal(f.run(agent).phase, 'exhausted');
-  assert.equal(agent.cancellations.at(-1).reason, 'codex-work:budget');
+  assert.equal(agent.cancellations.length, 0);
 });
 
-test('repeated failed probes do not consume extra quota windows and are bounded', async (t) => {
+test('configured fifty wait rounds are honored beyond the former forty-eight probe cap', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 24');
-  for (let i = 0; i < MAX_PROBES; i++) assert.deepEqual(await f.recover(agent, quotaFailure(0)), { kind: 'retry' });
-  assert.equal(f.run(agent).window, 1);
+  const agent = f.newAgent(); await f.operate(agent, 'start 50');
+  for (let round = 1; round <= 50; round++) {
+    assert.deepEqual(await f.recover(agent, { code: 'QUOTA', message: 'quota' }), { kind: 'retry' });
+    assert.equal(f.run(agent).window, round);
+  }
+  assert.equal(f.run(agent).attempts, 50);
+  assert.ok(agent.events.filter((e) => e.type === 'llm/retry').every((e) => e.data.maxRetries === 50));
   assert.equal(await f.recover(agent), undefined);
-  assert.equal(f.run(agent).phase, 'exhausted');
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(agent.cancellations.length, 0);
 });
 
 test('unknown errors delegate and disabled sessions do not intercept quota', async (t) => {
@@ -209,61 +217,75 @@ test('unknown errors delegate and disabled sessions do not intercept quota', asy
   assert.equal(delegated, 2);
 });
 
-test('deadlines stop before an impossible wait and cannot be bypassed by normal retry', async (t) => {
-  const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 1');
-  assert.equal(await f.recover(agent, quotaFailure(61)), undefined);
-  assert.equal(f.run(agent).phase, 'expired');
-  assert.equal(agent.abort.signal.aborted, true);
+test('a long provider wait is not cut short by any removed wall-clock limit', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
+  const recovery = f.recover(agent, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 72 * HOUR });
+  const target = f.waiters[0].deadline;
+  f.tick(target - 1);
+  assert.equal(f.waiters[0].settled, false);
+  assert.equal(agent.cancellations.length, 0);
+  f.tick(target); f.waiters[0].resolve(true);
+  assert.deepEqual(await recovery, { kind: 'retry' });
 });
 
-test('user cancellation aborts a real outstanding wait promptly', async (t) => {
-  let waiting;
-  const ready = new Promise((resolve) => { waiting = resolve; });
-  const f = fixture({ waitUntil: (deadline, signal, now) => { waiting(); return waitUntil(deadline, signal, now); } });
+test('user cancellation aborts a real outstanding wait but preserves enable for the next turn', async (t) => {
+  let ready; const waiting = new Promise((resolve) => { ready = resolve; });
+  const f = fixture({ waitUntil: (deadline, signal, now) => { ready(); return waitUntil(deadline, signal, now); } });
   await f.init(); t.after(() => f.dispose());
   const agent = f.newAgent(); await f.operate(agent, 'start');
-  const recovery = f.recover(agent);
-  await ready;
-  agent.cancel({ kind: 'user' });
+  const recovery = f.recover(agent); await waiting; agent.cancel({ kind: 'user' });
   assert.equal(await recovery, undefined);
-  assert.equal(f.run(agent).phase, 'interrupted');
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(f.run(agent).phase, 'armed');
   assert.equal(agent.events.some((e) => e.type === 'llm/retry-started'), false);
+  f.startTurn(agent, 2);
+  assert.equal(f.run(agent).window, 0);
+  assert.equal(f.run(agent).attempts, 0);
 });
 
-test('tool and UI command use the same operation; stop releases waiting work', async (t) => {
-  let waiting;
-  const ready = new Promise((resolve) => { waiting = resolve; });
-  const f = fixture({ waitUntil: (deadline, signal, now) => { waiting(); return waitUntil(deadline, signal, now); } });
-  await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  const tool = f.tool();
-  const result = await tool.execute({ action: 'start', windows: 3, hours: 18 }, { agent, signal: new AbortController().signal });
-  assert.equal(result.kind, 'success');
-  const recovery = f.recover(agent); await ready;
-  await tool.execute({ action: 'stop' }, { agent, signal: new AbortController().signal });
-  assert.equal(await recovery, undefined);
+test('tool stop leaves the current wait unchanged and disables future handling without cancelling', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); const tool = f.tool();
+  const exec = { agent, signal: new AbortController().signal };
+  assert.equal((await tool.execute({ action: 'start', windows: 3 }, exec)).kind, 'success');
+  const recovery = f.recover(agent); const before = { ...f.run(agent) };
+  assert.equal((await tool.execute({ action: 'stop' }, exec)).kind, 'success');
+  assert.equal(f.waiters[0].settled, false);
+  assert.equal(f.run(agent).enabled, false);
+  assert.equal(f.run(agent).nextRetryAt, before.nextRetryAt);
+  assert.equal((await f.operate(agent, 'retry')).result.kind, 'error');
+  f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true);
+  assert.deepEqual(await recovery, { kind: 'retry' });
   assert.equal(f.run(agent).phase, 'stopped');
+  assert.equal(await f.recover(agent), undefined);
+  assert.equal(agent.cancellations.length, 0);
 });
 
-test('plugin unload cancels and drains outstanding quota waits', async () => {
-  let waiting;
-  const ready = new Promise((resolve) => { waiting = resolve; });
-  const f = fixture({ waitUntil: (deadline, signal, now) => { waiting(); return waitUntil(deadline, signal, now); } });
-  await f.init(); const agent = f.newAgent(); await f.operate(agent, 'start');
-  const recovery = f.recover(agent); await ready;
+test('plugin unload wakes its pending original step once without cancelling any agent', async () => {
+  const f = controlledFixture(); await f.init();
+  const agent = f.newAgent(); const normal = f.newAgent();
+  await f.operate(agent, 'start'); await f.operate(normal, 'start');
+  const recovery = f.recover(agent); const before = { ...f.run(agent) };
   await f.dispose();
-  assert.equal(await recovery, undefined);
-  assert.equal(agent.cancellations.at(-1).reason, 'codex-work:unloaded');
+  assert.deepEqual(await recovery, { kind: 'retry' });
+  assert.equal(f.run(agent).window, before.window);
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(agent.events.filter((e) => e.type === 'llm/retry-started').length, 1);
+  assert.equal(agent.cancellations.length + normal.cancellations.length, 0);
+  assert.equal(getEventListeners(agent.abort.signal, 'abort').length, 0);
 });
 
-test('session replay rebuilds waiting state and crash closers mark interruption', async (t) => {
+test('session replay preserves enabled after interrupted turn closers and resets on the next turn', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
   const agent = f.newAgent(); await f.operate(agent, 'start'); await f.recover(agent);
-  let replay = agent.events.reduce(reduceState, initialState());
-  assert.deepEqual(replay.run, f.run(agent));
-  replay = reduceState(replay, { type: 'turn/end', data: { reason: { kind: 'interrupted' } } });
-  assert.equal(replay.run.phase, 'interrupted');
+  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
+  agent.session.append('turn/end', { turn: 1, reason: { kind: 'interrupted' } });
+  assert.equal(f.run(agent).enabled, true);
+  f.startTurn(agent, 2);
+  assert.equal(f.run(agent).phase, 'armed');
+  assert.equal(f.run(agent).window, 0);
+  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
 });
 
 test('parallel starts reserve through command commit and cannot reset window budgets', async (t) => {
@@ -275,30 +297,30 @@ test('parallel starts reserve through command commit and cannot reset window bud
   assert.deepEqual((await f.operate(agent, 'stop')).result.kind, 'success');
 });
 
-test('interrupted, failed and unrelated messages do not consume recovery windows', async (t) => {
+test('interrupted failed and unrelated replies neither spend rounds nor clear the live recovery', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
   const agent = f.newAgent(); await f.operate(agent, 'start'); await f.recover(agent);
-  for (const data of [
-    { turn: 1, step: 2, interrupted: true },
-    { turn: 9, step: 9 },
-    { turn: 1, step: 2, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error' } } }] },
-  ]) agent.session.append('assistant/message', { ...data, message: { source: { provider: PROVIDER } } });
+  const before = { ...f.run(agent) };
+  for (const data of [{ turn: 1, step: 2, interrupted: true }, { turn: 9, step: 9 },
+    { turn: 1, step: 2, stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: 'error' } } }] }]) {
+    agent.session.append('assistant/message', { ...data, message: { source: { provider: PROVIDER } } });
+  }
+  assert.deepEqual(f.run(agent), before);
+  success(agent);
   assert.equal(f.run(agent).window, 1);
   assert.equal(f.run(agent).attempts, 1);
-  success(agent); assert.equal(f.run(agent).window, 2);
 });
 
-test('arming mid-turn starts the deadline watchdog immediately after commit', async (t) => {
-  let callback; let delay;
-  const f = fixture({ timers: { setTimeout(fn, ms) { callback = fn; delay = ms; return {}; }, clearTimeout() {} } });
-  await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  await f.operate(agent, 'start 3 1');
-  assert.equal(delay, 60_000);
-  f.setClock(f.getClock() + HOUR);
-  callback();
-  assert.equal(agent.cancellations.at(-1).reason, 'codex-work:deadline');
-  assert.equal(f.run(agent).phase, 'expired');
+test('enabling mid-turn starts at zero and the projection schema has no time-limit fields', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start');
+  assert.equal(f.run(agent).turn, 1);
+  assert.equal(f.run(agent).window, 0);
+  assert.equal(f.definition().stateVersion, 8);
+  assert.equal('deadlineAt' in f.run(agent), false);
+  assert.equal('hours' in f.tool().parameters.properties, false);
+  assert.match(f.command().input.hint, /(?:^|\s)per-turn-rounds-v2(?:$|\s)/u);
+  assert.equal(f.scheduled.size, 0);
 });
 
 test('forks do not inherit the parent session recovery authorization', () => {
@@ -381,7 +403,7 @@ test('a long ZCode cooldown never delays the first Codex backoff', async (t) => 
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
   const zcode = f.newAgent('zcode', 'magpie-anthropic');
   const codex = f.newAgent('codex', 'magpie-responses');
-  await f.operate(zcode, 'start 3 8'); await f.operate(codex, 'start 3 8');
+  await f.operate(zcode, 'start 3'); await f.operate(codex, 'start 3');
   const startedAt = f.getClock();
   const long = f.recover(zcode, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 3 * HOUR });
   const short = f.recover(codex, { code: 'QUOTA', message: 'usage_limit_reached' });
@@ -400,7 +422,7 @@ test('another provider cannot extend an existing wait when its timer wakes', asy
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
   const codex = f.newAgent('codex', 'magpie-responses');
   const zcode = f.newAgent('zcode', 'magpie-anthropic');
-  await f.operate(codex, 'start 3 8'); await f.operate(zcode, 'start 3 8');
+  await f.operate(codex, 'start 3'); await f.operate(zcode, 'start 3');
   const short = f.recover(codex, { code: 'QUOTA', message: 'usage_limit_reached' });
   const long = f.recover(zcode, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 3 * HOUR });
   f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true);
@@ -416,7 +438,7 @@ test('another provider cannot extend an existing wait when its timer wakes', asy
 test('cooldown sharing and one-second staggering stay within the failed provider', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
   const agents = [f.newAgent('a1', 'a'), f.newAgent('b1', 'b'), f.newAgent('a2', 'a'), f.newAgent('b2', 'b')];
-  for (const agent of agents) await f.operate(agent, 'start 3 8');
+  for (const agent of agents) await f.operate(agent, 'start 3');
   const startedAt = f.getClock();
   const recoveries = agents.map((agent, i) => f.recover(agent, { code: 'QUOTA', message: 'quota',
     providerRetryAfterMs: [HOUR, 3 * HOUR, 60_000, 60_000][i] }));
@@ -431,7 +453,7 @@ test('cooldowns use the failed request provider after the model selection change
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
   const changed = f.newAgent('changed', 'magpie-responses');
   const codex = f.newAgent('codex', 'magpie-responses');
-  await f.operate(changed, 'start 3 8'); await f.operate(codex, 'start 3 8');
+  await f.operate(changed, 'start 3'); await f.operate(codex, 'start 3');
   const startedAt = f.getClock();
   const long = f.recover(changed, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 3 * HOUR },
     undefined, 'magpie-anthropic');
@@ -448,7 +470,7 @@ test('real Codex reset schedules its original step independently of a longer ZCo
   f.setClock(Date.parse('2026-11-12T17:59:32+08:00'));
   const zcode = f.newAgent('zcode', 'magpie-anthropic');
   const codex = f.newAgent('codex', 'magpie-responses');
-  await f.operate(zcode, 'start 3 8'); await f.operate(codex, 'start 3 8');
+  await f.operate(zcode, 'start 3'); await f.operate(codex, 'start 3');
   const long = f.recover(zcode, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 5 * HOUR });
   const short = f.recover(codex, { code: 'QUOTA', message: 'magpie-responses API error (429): ' +
     JSON.stringify({ type: 'usage_limit_reached', resets_at: 1794488591, resets_in_seconds: 11226,
@@ -466,243 +488,166 @@ test('real Codex reset schedules its original step independently of a longer ZCo
   assert.deepEqual(await long, { kind: 'retry' });
 });
 
-test('waiting update extends watchdog and recovery uses new deadline through cooldown extension', async (t) => {
+test('updating the round budget preserves the current wait and later provider extension', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
   const a = f.newAgent('a'); const b = f.newAgent('b');
-  await f.operate(a, 'start 3 1'); await f.operate(b, 'start 3 3');
-  const originalDeadline = f.run(a).deadlineAt;
+  await f.operate(a, 'start 3'); await f.operate(b, 'start 3');
   const first = f.recover(a, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: HOUR / 2 });
   const second = f.recover(b, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 2 * HOUR });
   const before = { ...f.run(a) };
-  const oldTimer = [...f.scheduled][0];
-  assert.equal((await f.operate(a, 'update 3 3')).result.kind, 'success');
-  assert.deepEqual(f.run(a), { ...before, deadlineAt: before.startedAt + 3 * HOUR });
-  assert.equal(f.waiters.length, 2);
-  assert.equal(f.waiters[0].signal.aborted, false);
-  oldTimer.callback();
-  assert.equal(a.cancellations.length, 0);
-  f.tick(originalDeadline + HOUR / 2);
-  f.waiters[0].resolve(true); await Promise.resolve();
+  await f.operate(a, 'update 1');
+  assert.deepEqual(f.run(a), { ...before, maxWindows: 1 });
+  f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true); await Promise.resolve();
   assert.equal(f.waiters.length, 3);
-  assert.ok(f.waiters[2].deadline > originalDeadline);
-  assert.equal(a.cancellations.length, 0);
-  assert.equal(f.run(a).attempts, before.attempts);
-  f.tick(Math.max(...f.waiters.map((waiter) => waiter.deadline)));
+  assert.equal(f.run(a).window, 1);
+  f.tick(Math.max(...f.waiters.map((item) => item.deadline)));
   f.waiters[1].resolve(true); f.waiters[2].resolve(true);
-  assert.deepEqual(await first, { kind: 'retry' });
-  assert.deepEqual(await second, { kind: 'retry' });
+  assert.deepEqual(await first, { kind: 'retry' }); assert.deepEqual(await second, { kind: 'retry' });
+  assert.equal(await f.recover(a), undefined);
+  assert.equal(a.cancellations.length, 0);
 });
 
-test('waiting update shortens deadline without changing current wait or counters', async (t) => {
+test('lowering the maximum below used rounds affects only a future failure', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
-  const recovery = f.recover(agent, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 2 * HOUR });
-  const before = { ...f.run(agent) };
-  assert.equal((await f.operate(agent, 'update 2 1')).result.kind, 'success');
-  assert.deepEqual(f.run(agent), { ...before, maxWindows: 2, deadlineAt: before.startedAt + HOUR });
-  assert.equal(f.waiters.length, 1);
-  assert.equal(f.waiters[0].signal.aborted, false);
-  f.tick(before.startedAt + HOUR);
-  assert.equal(await recovery, undefined);
-  assert.equal(f.run(agent).phase, 'expired');
-  assert.equal(agent.cancellations.at(-1).reason, 'codex-work:deadline');
-  assert.equal(agent.events.some((event) => event.type === 'llm/retry-started'), false);
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
+  const first = f.recover(agent); f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true); await first;
+  const second = f.recover(agent); const before = { ...f.run(agent) };
+  assert.equal(before.window, 2);
+  assert.equal((await f.operate(agent, 'update 1')).result.kind, 'success');
+  assert.deepEqual(f.run(agent), { ...before, maxWindows: 1 });
+  assert.equal(f.waiters[1].settled, false);
+  f.tick(f.waiters[1].deadline); f.waiters[1].resolve(true);
+  assert.deepEqual(await second, { kind: 'retry' });
+  assert.equal(await f.recover(agent), undefined);
+  assert.equal(agent.cancellations.length, 0);
 });
 
-test('update commits and replays limits only after successful command completion', async (t) => {
+test('updates commit and replay only after successful command completion', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
-  await f.recover(agent);
+  const agent = f.newAgent(); await f.operate(agent, 'start'); await f.recover(agent);
   const before = { ...f.run(agent) };
-  agent.session.append('command/run', { commandId: 'uncommitted', name: 'codex-work', args: 'update 2 2' });
+  agent.session.append('command/run', { commandId: 'uncommitted', name: 'codex-work', args: 'update 2' });
   assert.deepEqual(f.run(agent), before);
   agent.session.append('command/done', { commandId: 'uncommitted', kind: 'error' });
   assert.deepEqual(f.run(agent), before);
-  await f.operate(agent, 'update 2 2');
-  assert.deepEqual(f.run(agent), { ...before, maxWindows: 2, deadlineAt: before.startedAt + 2 * HOUR });
-  const replay = agent.events.reduce(reduceState, initialState());
-  assert.deepEqual(replay.run, f.run(agent));
-  assert.deepEqual(replay.pending, {});
+  await f.operate(agent, 'update 2');
+  assert.deepEqual(f.run(agent), { ...before, maxWindows: 2 });
+  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
 });
 
-test('rejects illegal updates without changing run state or reviving expired runs', async (t) => {
+test('invalid round updates preserve state while valid updates remain available after long idle time', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
   const agent = f.newAgent();
-  assert.equal((await f.operate(agent, 'update 2 2')).result.kind, 'error');
-  await f.operate(agent, 'start 3 3'); await f.recover(agent); success(agent);
-  const before = { ...f.run(agent) };
-  for (const input of ['update', 'update 2', 'update 0 2', 'update 9007199254740992 2', 'update 2 NaN',
-    'update 2 Infinity', 'update 2 0', 'update 2 -1', 'update 1 2']) {
-    assert.equal((await f.operate(agent, input)).result.kind, 'error', input);
-    assert.deepEqual(f.run(agent), before, input);
+  assert.equal((await f.operate(agent, 'update 2')).result.kind, 'error');
+  await f.operate(agent, 'start'); const before = { ...f.run(agent) };
+  for (const input of ['update', 'update 0', 'update -1', 'update 2.5', 'update 9007199254740992', 'update 2 18']) {
+    assert.equal((await f.operate(agent, input)).result.kind, 'error');
+    assert.deepEqual(f.run(agent), before);
   }
-  f.setClock(before.startedAt + HOUR);
-  assert.equal((await f.operate(agent, 'update 2 1')).result.kind, 'error');
-  assert.deepEqual(f.run(agent), before);
-  f.setClock(before.startedAt + 3 * HOUR);
-  assert.equal((await f.operate(agent, 'update 2 4')).result.kind, 'error');
-  assert.deepEqual(f.run(agent), before);
+  f.setClock(f.getClock() + 10_000 * HOUR);
+  assert.equal((await f.operate(agent, 'update 1')).result.kind, 'success');
+  assert.equal(f.run(agent).enabled, true);
 });
 
-test('tool update shares command operation and reservations serialize concurrent mutations', async (t) => {
+test('tool updates use the real command handler and serialize concurrent mutations', async (t) => {
   const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
+  const agent = f.newAgent(); await f.operate(agent, 'start');
   const tool = f.tool(); const exec = { agent, signal: new AbortController().signal };
-  assert.ok(tool.parameters.properties.action.enum.includes('update'));
-  await assert.rejects(tool.execute({ action: 'update', windows: 2 }, exec), /requires windows and hours/u);
-  assert.equal((await tool.execute({ action: 'update', windows: 2, hours: 2 }, exec)).kind, 'success');
-  assert.equal(f.run(agent).maxWindows, 2);
-  assert.equal(f.run(agent).deadlineAt, f.run(agent).startedAt + 2 * HOUR);
-  const results = await Promise.all([f.operate(agent, 'update 3 4'), f.operate(agent, 'update 2 2'), f.operate(agent, 'stop')]);
+  await assert.rejects(tool.execute({ action: 'update' }, exec), /requires windows/u);
+  assert.equal((await tool.execute({ action: 'update', windows: 2 }, exec)).kind, 'success');
+  const results = await Promise.all([f.operate(agent, 'update 3'), f.operate(agent, 'update 2'), f.operate(agent, 'stop')]);
   assert.deepEqual(results.map((entry) => entry.result.kind), ['success', 'error', 'error']);
   assert.equal(f.run(agent).maxWindows, 3);
-  assert.equal(f.run(agent).deadlineAt, f.run(agent).startedAt + 4 * HOUR);
-  assert.equal(agent.events.filter((event) => event.type === 'command/run' && event.data.args.trim() === 'update 2 2').length, 2);
+  assert.equal(agent.cancellations.length, 0);
 });
 
-
-test('updates preserve the next quota window while waiting and retrying', async (t) => {
+test('updates can lower the maximum during waiting and retrying without discarding either execution', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
-  const recovery = f.recover(agent);
-  const waiting = { ...f.run(agent) };
-  assert.equal(waiting.phase, 'waiting');
-  assert.equal(waiting.window, 1);
-  assert.equal(waiting.pendingRecovery, true);
-  const rejected = await f.operate(agent, 'update 1 3');
-  assert.equal(rejected.result.kind, 'error');
-  assert.match(rejected.result.text, /保留当前等待恢复的下一窗口/u);
-  assert.deepEqual(f.run(agent), waiting);
-  assert.equal((await f.operate(agent, 'update 2 3')).result.kind, 'success');
-  assert.equal(f.waiters.length, 1);
+  const agent = f.newAgent(); await f.operate(agent, 'start');
+  const recovery = f.recover(agent); const before = { ...f.run(agent) };
+  await f.operate(agent, 'update 1');
+  assert.deepEqual(f.run(agent), { ...before, maxWindows: 1 });
+  assert.equal(f.waiters[0].settled, false);
+  f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true); await recovery;
+  assert.equal((await f.operate(agent, 'update 1')).result.kind, 'success');
+  success(agent); assert.equal(f.run(agent).window, 1);
+  assert.equal(f.run(agent).maxWindows, 1);
+});
+
+test('large per-turn budgets start update and replay without a hidden hard cap', async (t) => {
+  const f = fixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); const exec = { agent, signal: new AbortController().signal };
+  assert.equal(f.tool().parameters.properties.windows.maximum, Number.MAX_SAFE_INTEGER);
+  assert.equal((await f.tool().execute({ action: 'start', windows: 100 }, exec)).kind, 'success');
+  for (let round = 1; round <= 4; round++) { await f.recover(agent); success(agent); assert.equal(f.run(agent).window, round); }
+  const before = { ...f.run(agent) };
+  await f.tool().execute({ action: 'update', windows: 200 }, exec);
+  assert.deepEqual(f.run(agent), { ...before, maxWindows: 200 });
+  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
+});
+
+test('persistent enable and settings survive completed errored and cancelled turns', async (t) => {
+  const f = fixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start 2');
+  const id = f.run(agent).id;
+  for (const [i, reason] of [{ kind: 'completed' }, { kind: 'error', error: { code: 'OTHER', message: 'failure' } },
+    { kind: 'aborted', reason: { kind: 'user' } }].entries()) {
+    await f.recover(agent);
+    agent.session.append('turn/end', { turn: agent.turn, reason });
+    assert.equal(f.run(agent).enabled, true);
+    f.startTurn(agent, i + 2);
+    assert.deepEqual([f.run(agent).window, f.run(agent).attempts, f.run(agent).phase], [0, 0, 'armed']);
+    assert.equal(f.run(agent).maxWindows, 2);
+    assert.equal(f.run(agent).id, id);
+  }
+});
+
+test('the live handler rejects removed time arguments instead of enabling hidden deadlines', async (t) => {
+  const f = fixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent();
+  assert.equal((await f.operate(agent, 'start 3 18')).result.kind, 'error');
+  assert.equal(f.run(agent), null);
+  await f.operate(agent, 'start 3'); const before = { ...f.run(agent) };
+  assert.equal((await f.operate(agent, 'update 4 24')).result.kind, 'error');
+  assert.deepEqual(f.run(agent), before);
+});
+
+test('normal start and stop never cancel the current agent or schedule a watchdog', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start 100');
+  await f.operate(agent, 'stop');
+  assert.equal(agent.abort.signal.aborted, false);
+  assert.equal(agent.cancellations.length, 0);
+  assert.equal(f.scheduled.size, 0);
+  f.tick(f.getClock() + 10_000 * HOUR);
+  assert.equal(f.run(agent).enabled, false);
+  assert.equal(f.run(agent).phase, 'stopped');
+});
+
+test('stop and reenable keep the current turn budget and freeze the old target against later cooldowns', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent('a'); const other = f.newAgent('b');
+  await f.operate(agent, 'start 3'); await f.operate(other, 'start 3');
+  const recovery = f.recover(agent, quotaFailure(1)); const before = { ...f.run(agent) };
+  await f.operate(agent, 'stop');
   assert.equal(f.waiters[0].signal.aborted, false);
+  await f.operate(agent, 'start 3');
+  assert.equal(f.run(agent).id, before.id);
+  assert.equal(f.run(agent).window, before.window);
+  assert.equal(f.run(agent).attempts, before.attempts);
+  assert.equal(f.run(agent).nextRetryAt, before.nextRetryAt);
+  const long = f.recover(other, quotaFailure(30));
   f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true);
   assert.deepEqual(await recovery, { kind: 'retry' });
-  const retrying = { ...f.run(agent) };
-  assert.equal(retrying.phase, 'retrying');
-  assert.equal((await f.operate(agent, 'update 1 3')).result.kind, 'error');
-  assert.deepEqual(f.run(agent), retrying);
-  success(agent);
-  assert.equal(f.run(agent).window, 2);
-  assert.equal(f.run(agent).maxWindows, 2);
-  assert.ok(f.run(agent).window <= f.run(agent).maxWindows);
-  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
+  assert.equal(f.waiters.length, 2);
+  assert.equal(agent.events.filter((e) => e.type === 'llm/retry-started').length, 1);
+  assert.equal(f.run(agent).enabled, true);
+  f.tick(f.waiters[1].deadline); f.waiters[1].resolve(true); await long;
 });
-
-
-test('large budgets start, update and replay without the former product caps', async (t) => {
-  const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  const tool = f.tool(); const exec = { agent, signal: new AbortController().signal };
-  assert.equal(tool.parameters.properties.windows.maximum, Number.MAX_SAFE_INTEGER);
-  assert.equal(tool.parameters.properties.hours.maximum, undefined);
-  assert.equal(tool.parameters.properties.hours.exclusiveMinimum, 0);
-  assert.equal((await tool.execute({ action: 'start', windows: 100, hours: 72 }, exec)).kind, 'success');
-  const startedAt = f.run(agent).startedAt;
-  assert.equal(f.run(agent).maxWindows, 100);
-  assert.equal(f.run(agent).deadlineAt, startedAt + 72 * HOUR);
-  for (let window = 2; window <= 5; window++) {
-    assert.deepEqual(await f.recover(agent, quotaFailure(0)), { kind: 'retry' });
-    success(agent);
-    assert.equal(f.run(agent).window, window);
-  }
-  const before = { ...f.run(agent) };
-  assert.equal((await tool.execute({ action: 'update', windows: 200, hours: 1000.5 }, exec)).kind, 'success');
-  assert.deepEqual(f.run(agent), { ...before, maxWindows: 200, deadlineAt: startedAt + 1000.5 * HOUR });
-  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
-});
-
-test('fractional positive hours preserve millisecond precision and safe Date boundaries', async (t) => {
-  assert.equal(deadlineFor(10_000, 0.001), 13_600);
-  assert.equal(deadlineFor(10_000, 0.0000001), 10_001);
-  assert.equal(deadlineFor(0, MAX_DATE_MS / HOUR), MAX_DATE_MS);
-  for (const [start, hours] of [[10_000, Number.MAX_VALUE], [10_000, MAX_DATE_MS / HOUR],
-    [0, Number.MAX_SAFE_INTEGER], [Number.MAX_SAFE_INTEGER, 1], [10_000, Number.MIN_VALUE]]) {
-    assert.throws(() => deadlineFor(start, hours), /有效截止日期/u);
-  }
-  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  assert.equal((await f.operate(agent, 'start 100 0.001')).result.kind, 'success');
-  const deadlineAt = f.run(agent).deadlineAt;
-  assert.equal(deadlineAt, f.run(agent).startedAt + 3600);
-  f.tick(deadlineAt - 1);
-  assert.equal(agent.cancellations.length, 0);
-  f.tick(deadlineAt);
-  assert.equal(f.run(agent).phase, 'expired');
-});
-
-test('overflowing deadlines are rejected on commands and replay without corrupting state', async (t) => {
-  const f = fixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  const rejected = await f.operate(agent, 'start 100 1e308');
-  assert.equal(rejected.result.kind, 'error');
-  assert.match(rejected.result.text, /有效截止日期/u);
-  assert.equal(f.run(agent), null);
-  await f.operate(agent, 'start 100 72');
-  const before = { ...f.run(agent) };
-  const update = await f.operate(agent, 'update 200 1e308');
-  assert.equal(update.result.kind, 'error');
-  assert.match(update.result.text, /有效截止日期/u);
-  assert.deepEqual(f.run(agent), before);
-  let state = initialState();
-  state = reduceState(state, { type: 'command/run', time: 10_000,
-    data: { commandId: 'overflow', name: 'codex-work', args: 'start 100 1e308' } });
-  state = reduceState(state, { type: 'command/done', time: 10_001,
-    data: { commandId: 'overflow', kind: 'success' } });
-  assert.equal(state.run, null);
-  assert.deepEqual(state.pending, {});
-  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, before);
-});
-
-test('long watchdog uses bounded absolute-time checks and never expires at a timer slice', async (t) => {
-  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent();
-  await f.operate(agent, 'start 100 1000');
-  const before = { ...f.run(agent) };
-  assert.ok(before.deadlineAt - before.startedAt > 2 ** 31 - 1);
-  const firstTimer = [...f.scheduled][0];
-  assert.equal(firstTimer.deadline, before.startedAt + 60_000);
-  f.tick(firstTimer.deadline);
-  assert.equal(agent.cancellations.length, 0);
-  assert.deepEqual(f.run(agent), before);
-  assert.equal([...f.scheduled][0].deadline, f.getClock() + 60_000);
-  // A resumed machine can jump over many slices; target time stays absolute.
-  f.tick(before.deadlineAt - 1);
-  assert.equal(agent.cancellations.length, 0);
-  assert.equal([...f.scheduled][0].deadline, before.deadlineAt);
-  f.tick(before.deadlineAt);
-  assert.equal(agent.cancellations.length, 1);
-  assert.equal(f.run(agent).phase, 'expired');
-  assert.equal(agent.cancellations[0].reason, 'codex-work:deadline');
-});
-
-test('long waiting budgets can extend and shorten without interrupting the recovery wait', async (t) => {
-  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 100 1000');
-  const recovery = f.recover(agent, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: 72 * HOUR });
-  const before = { ...f.run(agent) };
-  const oldTimer = [...f.scheduled][0];
-  assert.equal((await f.operate(agent, 'update 200 2000')).result.kind, 'success');
-  oldTimer.callback();
-  assert.equal(f.waiters.length, 1);
-  assert.equal(f.waiters[0].signal.aborted, false);
-  assert.equal(agent.cancellations.length, 0);
-  assert.equal((await f.operate(agent, 'update 100 24.5')).result.kind, 'success');
-  assert.equal(f.waiters.length, 1);
-  assert.equal(f.waiters[0].signal.aborted, false);
-  assert.equal(f.run(agent).deadlineAt, before.startedAt + 24.5 * HOUR);
-  assert.equal(f.run(agent).attempts, before.attempts);
-  f.tick(f.run(agent).deadlineAt - 1);
-  assert.equal(agent.cancellations.length, 0);
-  f.tick(f.run(agent).deadlineAt);
-  assert.equal(await recovery, undefined);
-  assert.equal(agent.cancellations.at(-1).reason, 'codex-work:deadline');
-});
-
 
 test('manual retry wakes the original wait immediately and keeps its retry identity and counters', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
   const recovery = f.recover(agent, quotaFailure(60));
   const before = { ...f.run(agent) }; const clock = f.getClock();
   assert.equal((await f.operate(agent, 'retry')).result.kind, 'success');
@@ -720,15 +665,16 @@ test('manual retry wakes the original wait immediately and keeps its retry ident
   const started = agent.events.filter((event) => event.type === 'llm/retry-started');
   assert.equal(started.length, 1);
   assert.deepEqual(started[0].data, { retryId: before.retryId, turn: before.turn, step: before.step, retry: before.attempts });
-  assert.equal(agent.events.some((event) => ['user/message', 'turn/start', 'tool/call'].includes(event.type)), false);
+  assert.equal(agent.events.some((event) => ['user/message', 'tool/call'].includes(event.type)), false);
+  assert.equal(agent.events.filter((event) => event.type === 'turn/start').length, 1);
   success(agent);
-  assert.equal(f.run(agent).window, before.window + 1);
+  assert.equal(f.run(agent).window, before.window);
   assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
 });
 
 test('manual retry is inert until success commits and failed commands remove their wake listener', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
   const recovery = f.recover(agent, quotaFailure(60));
   const before = { ...f.run(agent) }; const request = new AbortController();
   agent.session.append('command/run', { commandId: 'manual-failure', name: 'codex-work', args: 'retry' });
@@ -748,7 +694,7 @@ test('manual retry is inert until success commits and failed commands remove the
 
 test('retry commit append failure never wakes and its pending request is cleaned when the original wait ends', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
   const recovery = f.recover(agent, quotaFailure(5));
   const append = agent.session.append;
   agent.session.append = (type, data) => {
@@ -769,7 +715,7 @@ test('retry commit append failure never wakes and its pending request is cleaned
 
 test('concurrent manual retries and natural wake races emit at most one retry-started', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
   const recovery = f.recover(agent, quotaFailure(5));
   const results = await Promise.all([f.operate(agent, 'retry'), f.operate(agent, 'retry')]);
   assert.deepEqual(results.map((result) => result.result.kind), ['success', 'error']);
@@ -778,7 +724,7 @@ test('concurrent manual retries and natural wake races emit at most one retry-st
   assert.equal((await f.operate(agent, 'retry')).result.kind, 'error');
   assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 1);
 
-  const raced = f.newAgent(); await f.operate(raced, 'start 3 3');
+  const raced = f.newAgent(); await f.operate(raced, 'start 3');
   const automatic = f.recover(raced, quotaFailure(5));
   raced.session.append('command/run', { commandId: 'race', name: 'codex-work', args: 'retry' });
   const signal = new AbortController().signal;
@@ -796,7 +742,7 @@ test('concurrent manual retries and natural wake races emit at most one retry-st
 test('manual retry bypasses only this wait and leaves shared cooldown and other sessions untouched', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
   const a = f.newAgent('manual-a'); const b = f.newAgent('manual-b');
-  await f.operate(a, 'start 3 3'); await f.operate(b, 'start 3 3');
+  await f.operate(a, 'start 3'); await f.operate(b, 'start 3');
   const first = f.recover(a, quotaFailure(5));
   const second = f.recover(b, { code: 'QUOTA', message: 'quota', providerRetryAfterMs: HOUR });
   const bBefore = { ...f.run(b) };
@@ -807,103 +753,79 @@ test('manual retry bypasses only this wait and leaves shared cooldown and other 
   const failedAgain = f.recover(a, { code: 'QUOTA', message: 'quota' });
   assert.equal(f.run(a).attempts, 2);
   assert.ok(f.waiters[2].deadline >= bBefore.nextRetryAt);
-  assert.equal(f.run(a).window, 1);
+  assert.equal(f.run(a).window, 2);
   f.tick(Math.max(f.waiters[1].deadline, f.waiters[2].deadline));
   f.waiters[1].resolve(true); f.waiters[2].resolve(true);
   assert.deepEqual(await second, { kind: 'retry' });
   assert.deepEqual(await failedAgain, { kind: 'retry' });
 });
 
-test('manual retry rejects absent, restored-only, stopped, expired and cancelled waits', async (t) => {
+test('manual retry rejects absent restored-only disabled and user-cancelled waits', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const empty = f.newAgent();
-  assert.equal((await f.operate(empty, 'retry')).result.kind, 'error');
-  await f.operate(empty, 'start 3 3');
-  assert.equal((await f.operate(empty, 'retry')).result.kind, 'error');
+  const empty = f.newAgent(); assert.equal((await f.operate(empty, 'retry')).result.kind, 'error');
+  await f.operate(empty, 'start');
   empty.session.append('llm/retry', { retryId: 'restored', policyKey: POLICY_KEY, retry: 1, delayMs: 60_000, turn: 1, step: 1 });
-  assert.equal(f.run(empty).phase, 'waiting');
   assert.equal((await f.operate(empty, 'retry')).result.kind, 'error');
-
-  for (const mode of ['stop', 'expired', 'cancel']) {
-    const agent = f.newAgent(); await f.operate(agent, 'start 3 1');
-    const recovery = f.recover(agent, quotaFailure(5));
-    if (mode === 'stop') await f.operate(agent, 'stop');
-    else if (mode === 'cancel') agent.cancel({ kind: 'user' });
-    else f.setClock(f.run(agent).deadlineAt);
-    assert.equal((await f.operate(agent, 'retry')).result.kind, 'error', mode);
-    if (mode === 'expired') f.tick(f.getClock());
-    assert.equal(await recovery, undefined);
-    assert.equal(f.waiters.at(-1).settled, true);
-    assert.equal(agent.events.some((event) => event.type === 'llm/retry-started'), false);
+  for (const mode of ['stop', 'cancel']) {
+    const agent = f.newAgent(); await f.operate(agent, 'start'); const recovery = f.recover(agent);
+    if (mode === 'stop') await f.operate(agent, 'stop'); else agent.cancel({ kind: 'user' });
+    assert.equal((await f.operate(agent, 'retry')).result.kind, 'error');
+    if (mode === 'stop') { f.tick(f.waiters.at(-1).deadline); f.waiters.at(-1).resolve(true); }
+    assert.deepEqual(await recovery, mode === 'stop' ? { kind: 'retry' } : undefined);
   }
 });
 
-test('retry tool shares the committed command operation and permits the already scheduled final probe', async (t) => {
+test('manual retry is allowed for the last already-consumed wait round', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
-  agent.session.append('llm/retry', { retryId: 'prior', policyKey: POLICY_KEY, retry: MAX_PROBES - 1, delayMs: 1, turn: 1, step: 1 });
-  const recovery = f.recover(agent, { code: 'QUOTA', message: 'quota' });
-  assert.equal(f.run(agent).attempts, MAX_PROBES);
-  const tool = f.tool();
-  assert.ok(tool.parameters.properties.action.enum.includes('retry'));
-  assert.equal((await tool.execute({ action: 'retry' }, { agent, signal: new AbortController().signal })).kind, 'success');
-  assert.deepEqual(await recovery, { kind: 'retry' });
-  assert.equal(f.run(agent).attempts, MAX_PROBES);
+  const agent = f.newAgent(); await f.operate(agent, 'start 1');
+  const recovery = f.recover(agent);
   assert.equal(f.run(agent).window, 1);
-  assert.equal(await f.recover(agent, { code: 'QUOTA', message: 'quota' }), undefined);
+  assert.equal((await f.tool().execute({ action: 'retry' }, { agent, signal: new AbortController().signal })).kind, 'success');
+  assert.deepEqual(await recovery, { kind: 'retry' });
+  assert.equal(f.run(agent).window, 1);
+  assert.equal(await f.recover(agent), undefined);
   assert.equal(f.run(agent).phase, 'exhausted');
-  assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 1);
-  assert.deepEqual(agent.events.reduce(reduceState, initialState()).run, f.run(agent));
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(agent.cancellations.length, 0);
 });
 
-test('manual retry abort, stop and unload remove pending command and waiting listeners', async () => {
-  for (const mode of ['request-abort', 'stop', 'unload']) {
-    const f = controlledFixture(); await f.init();
-    const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
-    const recovery = f.recover(agent, quotaFailure(5));
-    const signal = new AbortController();
+test('aborted manual requests user cancellation and unload clean all waiting listeners', async () => {
+  for (const mode of ['request-abort', 'cancel', 'unload']) {
+    const f = controlledFixture(); await f.init(); const agent = f.newAgent(); await f.operate(agent, 'start');
+    const recovery = f.recover(agent); const signal = new AbortController();
     agent.session.append('command/run', { commandId: mode, name: 'codex-work', args: 'retry' });
-    assert.equal((await f.command().handler({ commandId: mode, agent, rawInput: 'retry', signal: signal.signal })).kind, 'success');
-    assert.equal(getEventListeners(signal.signal, 'abort').length, 1);
+    await f.command().handler({ commandId: mode, agent, rawInput: 'retry', signal: signal.signal });
     if (mode === 'request-abort') {
       signal.abort();
-      assert.equal(f.waiters[0].settled, false);
       agent.session.append('command/done', { commandId: mode, kind: 'success' });
       assert.equal(f.waiters[0].settled, false);
-      await f.operate(agent, 'stop');
-    } else if (mode === 'stop') agent.cancel({ kind: 'user' });
-    else await f.dispose();
-    assert.equal(await recovery, undefined);
+      f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true);
+    } else if (mode === 'cancel') agent.cancel({ kind: 'user' }); else await f.dispose();
+    assert.deepEqual(await recovery, mode === 'cancel' ? undefined : { kind: 'retry' });
     assert.equal(getEventListeners(signal.signal, 'abort').length, 0);
     assert.equal(getEventListeners(f.waiters[0].signal, 'abort').length, 0);
-    assert.equal(f.waiters[0].settled, true);
+    assert.equal(getEventListeners(agent.abort.signal, 'abort').length, 0);
     await f.dispose();
   }
 });
 
-test('manual retry cancels its real wait timer while leaving the deadline watchdog alive', async () => {
+test('manual retry clears its only real timer and leaves no watchdog', async () => {
   const scheduled = new Set();
-  const timers = {
-    setTimeout(callback, delay) { const timer = { callback, delay }; scheduled.add(timer); return timer; },
-    clearTimeout(timer) { scheduled.delete(timer); },
-  };
-  const f = fixture({ timers, waitUntil: (deadline, signal, now) => waitUntil(deadline, signal, now, timers) });
-  await f.init();
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
-  const recovery = f.recover(agent, quotaFailure(5));
-  assert.equal(scheduled.size, 2);
-  assert.equal((await f.operate(agent, 'retry')).result.kind, 'success');
-  assert.deepEqual(await recovery, { kind: 'retry' });
+  const timers = { setTimeout(callback, delay) { const timer = { callback, delay }; scheduled.add(timer); return timer; },
+    clearTimeout(timer) { scheduled.delete(timer); } };
+  const f = fixture({ waitUntil: (deadline, signal, now) => waitUntil(deadline, signal, now, timers) });
+  await f.init(); const agent = f.newAgent(); await f.operate(agent, 'start');
+  const recovery = f.recover(agent);
   assert.equal(scheduled.size, 1);
+  await f.operate(agent, 'retry'); assert.deepEqual(await recovery, { kind: 'retry' });
+  assert.equal(scheduled.size, 0);
   assert.equal(agent.cancellations.length, 0);
   await f.dispose();
-  assert.equal(scheduled.size, 0);
 });
-
 
 test('quota failure after manual retry resumes the original automatic backoff sequence', async (t) => {
   const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
-  const agent = f.newAgent(); await f.operate(agent, 'start 3 3');
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
   assert.deepEqual(parseInput('retry'), { action: 'retry' });
   assert.throws(() => parseInput('retry 3'), /用法/u);
   const clock = f.getClock();
@@ -914,11 +836,156 @@ test('quota failure after manual retry resumes the original automatic backoff se
   const failedAgain = f.recover(agent, { code: 'QUOTA', message: 'quota' });
   assert.equal(f.waiters[1].deadline, clock + 120_000);
   assert.equal(f.run(agent).attempts, 2);
-  assert.equal(f.run(agent).window, 1);
+  assert.equal(f.run(agent).window, 2);
   f.tick(f.waiters[1].deadline); f.waiters[1].resolve(true);
   assert.deepEqual(await failedAgain, { kind: 'retry' });
   assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 2);
   success(agent);
   assert.equal(f.run(agent).window, 2);
-  assert.equal(f.run(agent).attempts, 0);
+  assert.equal(f.run(agent).attempts, 2);
+});
+
+
+test('a failed start completion cannot enable recovery or disturb the agent', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent();
+  agent.session.append('command/run', { commandId: 'start-failed', name: 'codex-work', args: 'start 3' });
+  const result = await f.command().handler({ commandId: 'start-failed', agent,
+    rawInput: 'start 3', signal: new AbortController().signal });
+  assert.equal(result.kind, 'success');
+  assert.equal(f.run(agent), null);
+  agent.session.append('command/done', { commandId: 'start-failed', kind: 'error' });
+  assert.equal(f.run(agent), null);
+  assert.equal((await f.operate(agent, 'start 3')).result.kind, 'success');
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(agent.cancellations.length, 0);
+});
+
+test('failed stop is inert even for shared cooldown extension of a live wait', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const a = f.newAgent('a'); const b = f.newAgent('b');
+  await f.operate(a, 'start'); await f.operate(b, 'start');
+  const first = f.recover(a, quotaFailure(1)); const before = { ...f.run(a) };
+  a.session.append('command/run', { commandId: 'stop-failed', name: 'codex-work', args: 'stop' });
+  assert.equal((await f.command().handler({ commandId: 'stop-failed', agent: a,
+    rawInput: 'stop', signal: new AbortController().signal })).kind, 'success');
+  assert.deepEqual(f.run(a), before);
+  assert.equal(f.waiters[0].settled, false);
+  a.session.append('command/done', { commandId: 'stop-failed', kind: 'error' });
+  assert.deepEqual(f.run(a), before);
+  const second = f.recover(b, quotaFailure(30));
+  f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true); await Promise.resolve();
+  assert.equal(f.waiters.length, 3);
+  assert.equal(f.run(a).window, 1);
+  f.tick(Math.max(...f.waiters.map((item) => item.deadline)));
+  f.waiters[1].resolve(true); f.waiters[2].resolve(true);
+  assert.deepEqual(await first, { kind: 'retry' }); assert.deepEqual(await second, { kind: 'retry' });
+  assert.equal(a.cancellations.length, 0);
+});
+
+test('stopping then user-cancelling a retained wait never sends its retry', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start');
+  const recovery = f.recover(agent); await f.operate(agent, 'stop');
+  agent.cancel({ kind: 'user' });
+  assert.equal(await recovery, undefined);
+  assert.equal(f.run(agent).enabled, false);
+  assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 0);
+  assert.equal(getEventListeners(agent.abort.signal, 'abort').length, 0);
+  f.startTurn(agent, 2);
+  assert.equal(f.run(agent).phase, 'stopped');
+  assert.equal(f.run(agent).window, 0);
+});
+
+test('reenabling a retained wait permits explicit manual retry without resetting its budget', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
+  const recovery = f.recover(agent); const before = { ...f.run(agent) };
+  await f.operate(agent, 'stop');
+  assert.equal((await f.operate(agent, 'retry')).result.kind, 'error');
+  await f.operate(agent, 'start 3');
+  assert.equal(f.waiters[0].settled, false);
+  assert.equal(f.run(agent).nextRetryAt, before.nextRetryAt);
+  assert.equal((await f.operate(agent, 'retry')).result.kind, 'success');
+  assert.deepEqual(await recovery, { kind: 'retry' });
+  assert.equal(f.run(agent).window, 1);
+  assert.equal(f.run(agent).attempts, 1);
+  assert.equal(f.run(agent).id, before.id);
+  assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 1);
+  const next = f.recover(agent); assert.equal(f.run(agent).window, 2);
+  await f.operate(agent, 'retry'); await next;
+});
+
+test('an old turn wait cannot remove the new turn waiter during asynchronous cleanup', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start 3');
+  const old = f.recover(agent); f.startTurn(agent, 2);
+  const next = f.recover(agent); const current = { ...f.run(agent) };
+  assert.equal(await old, undefined);
+  assert.equal(f.run(agent).turn, 2);
+  assert.equal(f.run(agent).window, 1);
+  assert.equal((await f.operate(agent, 'retry')).result.kind, 'success');
+  assert.deepEqual(await next, { kind: 'retry' });
+  assert.equal(f.run(agent).retryId, current.retryId);
+  const started = agent.events.filter((event) => event.type === 'llm/retry-started');
+  assert.equal(started.length, 1); assert.equal(started[0].data.turn, 2);
+  assert.equal(agent.cancellations.length, 0);
+});
+
+test('unload never revives a wait whose original turn signal was cancelled', async () => {
+  const f = controlledFixture(); await f.init(); const agent = f.newAgent();
+  await f.operate(agent, 'start'); const recovery = f.recover(agent);
+  agent.abort.abort(); await f.dispose();
+  assert.equal(await recovery, undefined);
+  assert.equal(agent.cancellations.length, 0);
+  assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 0);
+});
+
+test('budget exhaustion reflects quota evidence and lets native handling decide the outcome', async (t) => {
+  const f = fixture(); await f.init(); t.after(() => f.dispose());
+  const agent = f.newAgent(); await f.operate(agent, 'start 1'); await f.recover(agent); success(agent);
+  let called = 0; const native = async () => { called++; return { kind: 'retry' }; };
+  await f.recover(agent, { code: 'AUTH', message: 'invalid credentials' }, native);
+  assert.equal(f.run(agent).phase, 'running');
+  await f.recover(agent, { code: 'QUOTA', message: 'usage_limit_reached' }, native);
+  assert.equal(called, 2);
+  assert.equal(f.run(agent).phase, 'exhausted');
+  assert.equal(f.run(agent).enabled, true);
+  assert.equal(agent.events.filter((event) => event.type === 'llm/retry').length, 1);
+  assert.equal(agent.cancellations.length, 0);
+});
+
+
+test('an extended existing second wait keeps legal retry metadata after lowering the maximum to one', async (t) => {
+  const f = controlledFixture(); await f.init(); t.after(() => f.dispose());
+  const a = f.newAgent('a'); const b = f.newAgent('b');
+  await f.operate(a, 'start 3'); await f.operate(b, 'start 3');
+  const first = f.recover(a, quotaFailure(1));
+  f.tick(f.waiters[0].deadline); f.waiters[0].resolve(true); await first;
+  const second = f.recover(a, quotaFailure(1)); const identity = f.run(a).retryId;
+  await f.operate(a, 'update 1');
+  const other = f.recover(b, quotaFailure(30));
+  f.tick(f.waiters[1].deadline); f.waiters[1].resolve(true); await Promise.resolve();
+  assert.equal(f.waiters.length, 4);
+  assert.deepEqual([f.run(a).window, f.run(a).attempts, f.run(a).maxWindows], [2, 2, 1]);
+  const extension = a.events.filter((event) => event.type === 'llm/retry').at(-1);
+  assert.equal(extension.data.retryId, identity);
+  assert.deepEqual([extension.data.retry, extension.data.maxRetries], [2, 2]);
+  f.tick(Math.max(...f.waiters.map((waiter) => waiter.deadline)));
+  f.waiters[2].resolve(true); f.waiters[3].resolve(true);
+  assert.deepEqual(await second, { kind: 'retry' }); assert.deepEqual(await other, { kind: 'retry' });
+  assert.equal(await f.recover(a), undefined);
+  assert.equal(a.cancellations.length, 0);
+});
+
+
+test('plugin unload cannot revive a waiter already invalidated by agent disposal', async () => {
+  const f = controlledFixture(); await f.init(); const agent = f.newAgent();
+  await f.operate(agent, 'start'); const recovery = f.recover(agent);
+  f.listeners.get('agent/disposed')({ agent });
+  await f.dispose();
+  assert.equal(await recovery, undefined);
+  assert.equal(agent.events.filter((event) => event.type === 'llm/retry-started').length, 0);
+  assert.equal(agent.cancellations.length, 0);
+  assert.equal(getEventListeners(agent.abort.signal, 'abort').length, 0);
 });

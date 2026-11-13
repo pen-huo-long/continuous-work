@@ -1,6 +1,5 @@
 export const POLICY_KEY = 'codex-work/v1';
 export const PROVIDER = 'openai-codex';
-export const MAX_PROBES = 48;
 export const HOUR = 3_600_000;
 export const MAX_DATE_MS = 8_640_000_000_000_000;
 
@@ -9,29 +8,27 @@ export function parseInput(input = '') {
   const action = parts[0] || 'status';
   if (action === 'start' || action === 'update') {
     const windows = Number(parts[1] ?? 3);
-    const hours = Number(parts[2] ?? 18);
-    if ((action === 'update' && parts.length !== 3) || parts.length > 3 || !Number.isSafeInteger(windows) || windows < 1 ||
-        !Number.isFinite(hours) || hours <= 0) {
-      throw new Error(`用法：/codex-work ${action} [正安全整数窗口数] [正有限小时数，可小数]`);
+    if ((action === 'update' && parts.length !== 2) || parts.length > 2 ||
+        !Number.isSafeInteger(windows) || windows < 1) {
+      throw new Error(`用法：/codex-work ${action} [每轮最大等待次数，正安全整数]`);
     }
-    return { action, windows, hours };
+    return { action, windows };
   }
   if (!['status', 'stop', 'retry'].includes(action) || parts.length > 1) {
-    throw new Error('用法：/codex-work start 3 18 | update <窗口数> <总小时数> | retry | status | stop');
+    throw new Error('用法：/codex-work start [等待次数=3] | update <等待次数> | retry | status | stop');
   }
   return { action };
 }
 
-// Millisecond timestamps must be representable both as safe integers and Dates.
-// Round up fractional milliseconds so a positive duration cannot expire early.
-export function deadlineFor(startedAt, hours) {
-  const deadlineAt = Math.ceil(startedAt + hours * HOUR);
-  if (!Number.isFinite(hours) || hours <= 0 || !Number.isSafeInteger(startedAt) ||
-      Math.abs(startedAt) > MAX_DATE_MS || !Number.isSafeInteger(deadlineAt) ||
-      Math.abs(deadlineAt) > MAX_DATE_MS || deadlineAt <= startedAt) {
-    throw new Error('运行时限无法安全表示为有效截止日期，请调整小时数。');
+// Only historical command records accept the removed wall-clock argument.
+function replayInput(input = '') {
+  const parts = input.trim().split(/\s+/u);
+  if (['start', 'update'].includes(parts[0]) && parts.length === 3) {
+    const hours = Number(parts[2]);
+    if (!Number.isFinite(hours) || hours <= 0) throw new Error('Invalid historical time limit');
+    return parseInput(parts.slice(0, 2).join(' '));
   }
-  return deadlineAt;
+  return parseInput(input);
 }
 
 // Evidence, not provider identity, decides quota recovery. DSH normalizes
@@ -112,32 +109,31 @@ export function retryDelay(quota, attempt) {
 }
 
 export function initialState(_header, inheritedEventCount = 0) {
-  return { run: null, pending: {}, skipBefore: inheritedEventCount };
+  return { run: null, pending: {}, skipBefore: inheritedEventCount, turn: null };
 }
 
 export function isActive(run) {
-  return run != null && ['armed', 'running', 'waiting', 'retrying'].includes(run.phase);
+  return run?.enabled === true;
 }
 
-export function updateError(run, input, time) {
-  if (!isActive(run) || time >= run.deadlineAt) return '当前没有可更新的活动托管，请先启用。';
-  const minWindows = run.window + (run.pendingRecovery ? 1 : 0);
-  if (input.windows < minWindows) return run.pendingRecovery ?
-    `窗口上限至少为 ${minWindows}，需保留当前等待恢复的下一窗口。` : '窗口上限不能小于当前已使用窗口数。';
-  let deadlineAt;
-  try { deadlineAt = deadlineFor(run.startedAt, input.hours); } catch (error) { return error.message; }
-  if (deadlineAt <= time) return '新的总时限已到期，请增加运行小时数。';
-  return null;
+export function updateError(run) {
+  return run ? null : '尚未设置托管，请先启用。';
 }
 
-// Only existing standard events are used, so session readers and migrations
-// do not need to understand a new event type. Command success commits arming.
+// The enabled switch is session-persistent; only the per-turn counters reset.
 export function reduceState(state, event) {
   if (event.seq < state.skipBefore) return state;
   const data = event.data;
+  const run = state.run;
+  const update = (patch) => ({ ...state, run: { ...run, ...patch } });
+  if (event.type === 'turn/start') {
+    return { ...state, turn: data.turn, run: run ? { ...run,
+      phase: run.enabled ? 'armed' : 'stopped', window: 0, attempts: 0, retryIds: [],
+      pendingRecovery: false, nextRetryAt: null, turn: data.turn, step: null, retryId: null } : null };
+  }
   if (event.type === 'command/run' && data.name === 'codex-work') {
     let input;
-    try { input = parseInput(data.args); } catch { return state; }
+    try { input = replayInput(data.args); } catch { return state; }
     if (input.action === 'status') return state;
     return { ...state, pending: { ...state.pending, [data.commandId]: { ...input, time: event.time } } };
   }
@@ -145,49 +141,60 @@ export function reduceState(state, event) {
     const operation = state.pending[data.commandId];
     const pending = { ...state.pending };
     delete pending[data.commandId];
-    if (data.kind !== 'success') return { ...state, pending };
-    if (operation.action === 'retry') return { ...state, pending };
+    if (data.kind !== 'success' || operation.action === 'retry') return { ...state, pending };
     if (operation.action === 'update') {
-      if (updateError(state.run, operation, event.time)) return { ...state, pending };
-      return { ...state, pending, run: { ...state.run,
-        maxWindows: operation.windows, deadlineAt: deadlineFor(state.run.startedAt, operation.hours) } };
+      if (updateError(run)) return { ...state, pending };
+      return { ...state, pending, run: { ...run, maxWindows: operation.windows,
+        phase: run.phase === 'exhausted' && run.window < operation.windows ? 'armed' : run.phase } };
     }
-    if (operation.action === 'stop') return { ...state, pending, run: state.run ? { ...state.run, phase: 'stopped', nextRetryAt: null } : null };
-    let deadlineAt;
-    try { deadlineAt = deadlineFor(operation.time, operation.hours); } catch { return { ...state, pending }; }
+    if (operation.action === 'stop') {
+      if (!run) return { ...state, pending };
+      const waiting = run.phase === 'waiting' && run.nextRetryAt !== null;
+      return { ...state, pending, run: { ...run, enabled: false,
+        phase: waiting ? 'waiting' : 'stopped', pendingRecovery: waiting,
+        nextRetryAt: waiting ? run.nextRetryAt : null, retryId: waiting ? run.retryId : null } };
+    }
+    if (run) return { ...state, pending, run: { ...run, enabled: true, maxWindows: operation.windows,
+      phase: run.phase === 'waiting' ? 'waiting' : 'armed' } };
     return { ...state, pending, run: {
-      id: data.commandId, phase: 'armed', startedAt: operation.time,
-      deadlineAt, maxWindows: operation.windows,
-      window: 1, attempts: 0, pendingRecovery: false, nextRetryAt: null,
-      turn: null, step: null, retryId: null,
+      id: data.commandId, enabled: true, phase: 'armed', startedAt: operation.time,
+      maxWindows: operation.windows, window: 0, attempts: 0, retryIds: [],
+      pendingRecovery: false, nextRetryAt: null, turn: state.turn, step: null, retryId: null,
     } };
   }
-  const run = state.run;
-  if (!isActive(run)) return state;
-  const update = (patch) => ({ ...state, run: { ...run, ...patch } });
-  if (event.type === 'llm/retry' && data.policyKey === POLICY_KEY) {
-    return update({ phase: 'waiting', attempts: data.retry, pendingRecovery: true,
-      nextRetryAt: event.time + data.delayMs, turn: data.turn, step: data.step, retryId: data.retryId });
+  if (event.type === 'turn/end') {
+    if (state.turn !== null && data.turn !== state.turn) return state;
+    return { ...state, turn: null, run: run ? { ...run, phase: run.enabled ? 'armed' : 'stopped',
+      pendingRecovery: false, nextRetryAt: null, retryId: null, step: null } : null };
   }
-  if (event.type === 'llm/retry-started' && run.phase === 'waiting' && data.retryId === run.retryId) {
-    return update({ phase: 'retrying', nextRetryAt: null });
+  if (!run) return state;
+  if (run.turn !== null && data.turn !== run.turn) return state;
+  if (event.type === 'llm/retry' && data.policyKey === POLICY_KEY && run.enabled) {
+    const fresh = !run.retryIds.includes(data.retryId);
+    if (!fresh && (data.retryId !== run.retryId || run.phase !== 'waiting')) return state;
+    return update({ phase: 'waiting', attempts: run.attempts + (fresh ? 1 : 0),
+      window: run.window + (fresh ? 1 : 0), retryIds: fresh ? [...run.retryIds, data.retryId] : run.retryIds,
+      pendingRecovery: true, nextRetryAt: event.time + data.delayMs,
+      turn: data.turn, step: data.step, retryId: data.retryId });
+  }
+  if (event.type === 'llm/retry-started' && run.phase === 'waiting' && data.retryId === run.retryId && data.step === run.step) {
+    return update({ phase: run.enabled ? 'retrying' : 'stopped', pendingRecovery: run.enabled,
+      nextRetryAt: null, retryId: run.enabled ? run.retryId : null });
+  }
+  if (event.type === 'assistant/attempt' && run.enabled && run.window >= run.maxWindows) {
+    const failure = data.stream?.find((record) => record.type === 'chunk' && record.chunk?.type === 'finish' &&
+      ['error', 'aborted'].includes(record.chunk.reason.kind))?.chunk.reason.failure;
+    if (classifyQuota('', failure, () => event.time)) {
+      return update({ phase: 'exhausted', pendingRecovery: false, nextRetryAt: null, retryId: null });
+    }
   }
   if (event.type === 'assistant/message' && !data.interrupted) {
     const failedFinish = data.stream?.some((record) => record.type === 'chunk' && record.chunk?.type === 'finish' &&
       ['error', 'aborted'].includes(record.chunk.reason.kind));
-    if (failedFinish || (run.pendingRecovery && (data.turn !== run.turn || data.step !== run.step))) return state;
-    return update({ phase: 'running', window: run.window + (run.pendingRecovery ? 1 : 0),
-      attempts: 0, pendingRecovery: false, nextRetryAt: null, retryId: null });
+    if (failedFinish || (run.pendingRecovery && data.step !== run.step)) return state;
+    return update({ phase: run.enabled ? 'running' : 'stopped',
+      pendingRecovery: false, nextRetryAt: null, retryId: null });
   }
-  if (event.type === 'turn/end' && data.reason.kind === 'completed') return update({ phase: 'armed' });
-  if (event.type === 'turn/end' && data.reason.kind !== 'completed') {
-    const reason = data.reason.reason?.reason ?? '';
-    const phase = reason === 'codex-work:deadline' ? 'expired' :
-      reason === 'codex-work:budget' ? 'exhausted' : 'interrupted';
-    return update({ phase, nextRetryAt: null });
-  }
-  // A normal turn may be followed by the existing goal driver. Do not wake it
-  // ourselves and do not equate a model's final answer with goal completion.
   return state;
 }
 

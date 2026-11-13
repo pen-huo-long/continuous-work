@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Continuous work",
-    "description": "Manage quota recovery across model providers. Recovery details and retry countdowns appear only during recovery, with immediate retry after restoring quota manually. A separate settings page offers custom window and time limits without fixed upper caps; defaults to 3 windows and 18 hours."
+    "description": "Manage quota recovery across model providers. The persistent session switch limits quota waits per conversation turn, defaulting to three; the count resets for each new turn. There is no runtime limit. Enable or disable recovery without actively cancelling the current execution."
   }
 }
