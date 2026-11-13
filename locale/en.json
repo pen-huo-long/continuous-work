@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Continuous work",
+    "description": "Manage quota recovery across model providers. Recovery details and retry countdowns appear only during recovery, with immediate retry after restoring quota manually. A separate settings page offers custom window and time limits without fixed upper caps; defaults to 3 windows and 18 hours."
+  }
+}

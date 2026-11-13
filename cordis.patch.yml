@@ -1,0 +1,4 @@
+- insert:
+    - id: continuous-work
+      name: '@local/continuous-work'
+      config: {}
